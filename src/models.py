@@ -1,22 +1,5 @@
 """
-Model training, evaluation, and plotting utilities.
-
-All functions are pure (no global state). Data is passed explicitly so cells
-can run in any order without side-effects.
-
-Fixes vs. the original notebook
----------------------------------
-* Double-scaling bug: cross_validate_model always receives raw (unscaled) data
-  and handles scaling per-fold internally. evaluate_model no longer pre-scales
-  before calling cross_validate_model.
-* all_results is passed as an explicit argument, not a global list.
-* clean_col_names / price-cap / split are all done in the feature pipeline;
-  load_data() just reads the parquet files and does a val split from train.
-* XGBoost and LightGBM are tuned with an expanded grid and then refitted with
-  early stopping on the validation set.
-* Stacking uses the tuned base-learner params, not hand-picked ones.
-* SHAP summary plot added for the best model (requires `pip install shap`).
-* Simple MLP removed; only the Residual MLP is kept.
+Model training, evaluation, and plotting
 """
 
 import re
@@ -32,6 +15,8 @@ from sklearn.ensemble import RandomForestRegressor, StackingRegressor
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.model_selection import train_test_split, KFold
 from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+from sklearn.base import clone
 from xgboost import XGBRegressor
 from lightgbm import LGBMRegressor
 
@@ -43,12 +28,12 @@ except ImportError:
 
 RANDOM_STATE = 42
 CV_FOLDS     = 5
-VAL_SIZE     = 0.15   # fraction of train set held out as validation
+VAL_SIZE     = 0.15   # fraction validation
 FIGURES_DIR  = Path('outputs/figures')
 MODELS_DIR   = Path('outputs/models')
 
 
-# ─── 1. Data loading ──────────────────────────────────────────────────────────
+#1. Data loading
 
 def load_data(
     encoding: str = 'hotenc',
@@ -61,11 +46,9 @@ def load_data(
     validation set from the training data.
 
     Parameters
-    ----------
     encoding : 'hotenc' or 'targetenc'
 
     Returns
-    -------
     X_train, X_val, X_test : pd.DataFrame
     y_train, y_val, y_test : pd.Series  (log_price)
     """
@@ -81,7 +64,6 @@ def load_data(
     X_test = test[feat_cols].copy()
     y_test = test['log_price'].copy()
 
-    # coerce any leftover bool columns to int
     for df in [X_all, X_test]:
         bool_cols = df.columns[df.dtypes == bool]
         df[bool_cols] = df[bool_cols].astype(int)
@@ -95,12 +77,12 @@ def load_data(
     return X_train, X_val, X_test, y_train, y_val, y_test
 
 
-# ─── 2. Metrics ───────────────────────────────────────────────────────────────
+# 2. Metrics
 
 def compute_metrics(y_true, y_pred_log) -> dict:
     """
-    Compute regression metrics in EUR space (after reversing the log transform).
-    R² is computed on log-price to be scale-invariant for model comparison.
+    Compute regression metrics in EUR (after reversing the log transform).
+    R² is computed on log-price.
     """
     y_true_eur = np.expm1(np.asarray(y_true))
     y_pred_eur = np.expm1(np.asarray(y_pred_log))
@@ -109,9 +91,7 @@ def compute_metrics(y_true, y_pred_log) -> dict:
     mae        = float(mean_absolute_error(y_true_eur, y_pred_eur))
     r2         = float(r2_score(y_true, y_pred_log))
     mape       = float(np.mean(np.abs((y_true_eur - y_pred_eur) / y_true_eur)) * 100)
-    within_20  = float(
-        np.mean(np.abs(y_true_eur - y_pred_eur) / y_true_eur < 0.20) * 100
-    )
+    within_20  = float(np.mean(np.abs(y_true_eur - y_pred_eur) / y_true_eur < 0.20) * 100)
 
     return {
         'rmse':        round(rmse, 2),
@@ -122,7 +102,25 @@ def compute_metrics(y_true, y_pred_log) -> dict:
     }
 
 
-# ─── 3. Cross-validation (fixed: no double-scaling) ──────────────────────────
+# 3. Cross-validation
+
+def _cv_safe_clone(model):
+    """
+    Return an unfitted clone of model that can be .fit(X, y) inside CV
+    without an eval_set
+    """
+    m = clone(model)
+    params = m.get_params()
+
+    if params.get('early_stopping_rounds') is not None:        # XGBoost tuned
+        best_it = getattr(model, 'best_iteration', None)
+        n = (int(best_it) + 1) if isinstance(best_it, (int, np.integer)) else params.get('n_estimators')
+        m.set_params(early_stopping_rounds=None, n_estimators=max(int(n or 1), 1))
+    elif getattr(model, 'best_iteration_', None):              # LightGBM tuned
+        m.set_params(n_estimators=max(int(model.best_iteration_), 1))
+
+    return m
+
 
 def cross_validate_model(
     model,
@@ -132,15 +130,11 @@ def cross_validate_model(
     scale: bool = False,
 ) -> dict:
     """
-    K-fold cross-validation. Always receives *raw* (unscaled) data.
-    Scaling is applied per-fold internally when scale=True, preventing
-    data leakage between folds and avoiding the double-scaling bug in
-    the original notebook.
-
-    Returns dict of {metric: (mean, std)}.
+    K-fold cross-validation
     """
     kf = KFold(n_splits=cv, shuffle=True, random_state=RANDOM_STATE)
     fold_scores = {k: [] for k in ['rmse', 'mae', 'r2', 'mape', 'within_20pct']}
+    template = _cv_safe_clone(model)
 
     for train_idx, val_idx in kf.split(X):
         X_tr = X.iloc[train_idx].copy()
@@ -153,8 +147,9 @@ def cross_validate_model(
             X_tr = pd.DataFrame(sc.fit_transform(X_tr), columns=X_tr.columns)
             X_vl = pd.DataFrame(sc.transform(X_vl),     columns=X_vl.columns)
 
-        model.fit(X_tr, y_tr)
-        metrics = compute_metrics(y_vl, model.predict(X_vl))
+        fold_model = clone(template)
+        fold_model.fit(X_tr, y_tr)
+        metrics = compute_metrics(y_vl, fold_model.predict(X_vl))
         for k, v in metrics.items():
             fold_scores[k].append(v)
 
@@ -164,7 +159,7 @@ def cross_validate_model(
     }
 
 
-# ─── 4. Full evaluation (fixed: explicit args, no globals) ───────────────────
+#4. Full evaluation
 
 def evaluate_model(
     name: str,
@@ -183,19 +178,12 @@ def evaluate_model(
     """
     Cross-validate on train, fit on full train, evaluate on val and test.
     Returns the fitted model.
-
-    Fixes vs. original
-    ------------------
-    - No globals: all data passed explicitly.
-    - CV receives raw X_train regardless of scale flag; scaling is done
-      per-fold inside cross_validate_model.
-    - Final fit uses a fresh scaler fitted only on X_train.
     """
     print(f"\n{'='*52}")
     print(f"  {name}")
     print(f"{'='*52}")
 
-    # ── Cross-validation (always raw data in, scale inside) ───────────────
+    # Cross-validation
     if skip_cv:
         print("\n[Cross-Validation] skipped")
         cv_res = {k: ('—', '—') for k in ['rmse', 'mae', 'r2', 'mape', 'within_20pct']}
@@ -205,24 +193,27 @@ def evaluate_model(
         for metric, (mean, std) in cv_res.items():
             print(f"  {metric:15s}: {mean:.3f} ± {std:.3f}")
 
-    # ── Final fit ─────────────────────────────────────────────────────────
+    # Final fit
     if scale:
         sc = StandardScaler()
         Xtr = pd.DataFrame(sc.fit_transform(X_train), columns=X_train.columns)
-        Xvl = pd.DataFrame(sc.transform(X_val),       columns=X_val.columns)
-        Xte = pd.DataFrame(sc.transform(X_test),      columns=X_test.columns)
+        Xvl = pd.DataFrame(sc.transform(X_val), columns=X_val.columns)
+        Xte = pd.DataFrame(sc.transform(X_test), columns=X_test.columns)
     else:
         Xtr, Xvl, Xte = X_train, X_val, X_test
 
-    model.fit(Xtr, y_train)
+    if getattr(model, 'early_stopping_rounds', None):
+        model.fit(Xtr, y_train, eval_set=[(Xvl, y_val)], verbose=False)
+    else:
+        model.fit(Xtr, y_train)
 
-    # ── Validation ────────────────────────────────────────────────────────
+    #Validation
     print("\n[Validation Set]")
     val_m = compute_metrics(y_val, model.predict(Xvl))
     for k, v in val_m.items():
         print(f"  {k:15s}: {v}")
 
-    # ── Test ──────────────────────────────────────────────────────────────
+    #Test
     print("\n[Test Set]")
     test_m = compute_metrics(y_test, model.predict(Xte))
     for k, v in test_m.items():
@@ -239,65 +230,67 @@ def evaluate_model(
     return model
 
 
-# ─── 5. Hyperparameter tuning with early stopping ────────────────────────────
+#5. Hyperparameter tuning
 
 def tune_xgboost(
     X_train: pd.DataFrame,
     y_train: pd.Series,
     X_val:   pd.DataFrame,
     y_val:   pd.Series,
-    n_iter:  int = 8,
+    n_iter:  int = 30,
 ) -> XGBRegressor:
     """
-    Random search on val set. Plain fit (no early stopping, no eval_set) per
-    candidate to avoid XGBoost threading/verbosity quirks across versions.
-    One final refit with early stopping after the best params are found.
+    Randomized search where each candidate is trained with early stopping on thevalidation set.
     """
     from sklearn.metrics import mean_squared_error
 
     param_dist = {
-        'max_depth':        [4, 6, 8],
-        'learning_rate':    [0.03, 0.05, 0.1, 0.15],
-        'subsample':        [0.7, 0.8, 0.9],
-        'colsample_bytree': [0.6, 0.8, 1.0],
-        'min_child_weight': [1, 3, 5],
-        'reg_alpha':        [0, 0.1, 1.0],
-        'reg_lambda':       [1.0, 2.0, 5.0],
+        'max_depth':        [3, 4, 5, 6, 8, 10],
+        'learning_rate':    [0.01, 0.02, 0.03, 0.05, 0.08, 0.1],
+        'subsample':        [0.6, 0.7, 0.8, 0.9, 1.0],
+        'colsample_bytree': [0.5, 0.6, 0.7, 0.8, 1.0],
+        'min_child_weight': [1, 3, 5, 7, 10],
+        'reg_alpha':        [0, 0.01, 0.1, 0.5, 1.0],
+        'reg_lambda':       [0.5, 1.0, 2.0, 5.0, 10.0],
+        'gamma':            [0, 0.1, 0.3, 0.5],
     }
 
     rng = np.random.RandomState(RANDOM_STATE)
-    best_score = np.inf
-    best_params = None
+    MAX_ROUNDS, STOP = 2000, 50
+    best_score, best_params, best_n = np.inf, None, MAX_ROUNDS
 
-    print(f"  Random search ({n_iter} candidates)...")
+    print(f"  Random search ({n_iter} candidates, early stopping)...")
     for i in range(n_iter):
         params = {k: rng.choice(v).item() for k, v in param_dist.items()}
         model = XGBRegressor(
             **params,
-            n_estimators=150,
+            n_estimators=MAX_ROUNDS,
             tree_method='hist',
+            early_stopping_rounds=STOP,
             random_state=RANDOM_STATE,
             n_jobs=-1,
         )
-        model.fit(X_train, y_train)
-        score = mean_squared_error(y_val, model.predict(X_val))
-        print(f"  [{i+1}/{n_iter}] RMSE={np.sqrt(score):.4f}  {params}")
+        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+        n_trees = model.best_iteration + 1            # best_iteration is 0 indexed
+        score   = np.sqrt(mean_squared_error(y_val, model.predict(X_val)))
+        print(f"  [{i+1}/{n_iter}] RMSE={score:.4f}  trees={n_trees}  {params}")
         if score < best_score:
-            best_score = score
-            best_params = params
+            best_score, best_params, best_n = score, params, n_trees
 
+    print(f"  Best RMSE={best_score:.4f} @ {best_n} trees")
     print(f"  Best params: {best_params}")
-    print(f"  Refitting with early stopping...")
     final = XGBRegressor(
         **best_params,
-        n_estimators=500,
+        n_estimators=MAX_ROUNDS,
         tree_method='hist',
-        early_stopping_rounds=30,
+        early_stopping_rounds=STOP,
         random_state=RANDOM_STATE,
         n_jobs=-1,
     )
     final.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
     print(f"  Best iteration: {final.best_iteration}")
+    final.tuned_params_   = {**best_params, 'n_estimators': int(final.best_iteration) + 1}
+    final.tuned_val_rmse_ = float(best_score)
     return final
 
 
@@ -306,101 +299,193 @@ def tune_lightgbm(
     y_train: pd.Series,
     X_val:   pd.DataFrame,
     y_val:   pd.Series,
-    n_iter:  int = 8,
+    n_iter:  int = 30,
 ) -> LGBMRegressor:
     """
-    Same plain-fit random search as tune_xgboost, then one refit with early stopping.
+    Same early-stopping random search as tune_xgboost
     """
     import lightgbm as lgb
     from sklearn.metrics import mean_squared_error
 
     param_dist = {
-        'max_depth':         [4, 6, 8],
-        'learning_rate':     [0.03, 0.05, 0.1, 0.15],
-        'subsample':         [0.7, 0.8, 0.9],
-        'colsample_bytree':  [0.6, 0.8, 1.0],
-        'min_child_samples': [10, 20, 50],
-        'reg_alpha':         [0, 0.1, 1.0],
-        'reg_lambda':        [1.0, 2.0, 5.0],
+        'num_leaves':        [15, 31, 63, 127],
+        'max_depth':         [-1, 4, 6, 8, 12],
+        'learning_rate':     [0.01, 0.02, 0.03, 0.05, 0.08, 0.1],
+        'subsample':         [0.6, 0.7, 0.8, 0.9, 1.0],
+        'colsample_bytree':  [0.5, 0.6, 0.7, 0.8, 1.0],
+        'min_child_samples': [5, 10, 20, 50, 100],
+        'reg_alpha':         [0, 0.01, 0.1, 0.5, 1.0],
+        'reg_lambda':        [0.5, 1.0, 2.0, 5.0, 10.0],
     }
 
     rng = np.random.RandomState(RANDOM_STATE)
-    best_score = np.inf
-    best_params = None
+    MAX_ROUNDS, STOP = 2000, 50
+    best_score, best_params, best_n = np.inf, None, MAX_ROUNDS
 
-    print(f"  Random search ({n_iter} candidates)...")
+    print(f"  Random search ({n_iter} candidates, early stopping)...")
     for i in range(n_iter):
         params = {k: rng.choice(v).item() for k, v in param_dist.items()}
         model = LGBMRegressor(
             **params,
-            n_estimators=150,
+            n_estimators=MAX_ROUNDS,
+            subsample_freq=1,
             random_state=RANDOM_STATE,
+            n_jobs=-1,
             verbose=-1,
         )
-        model.fit(X_train, y_train)
-        score = mean_squared_error(y_val, model.predict(X_val))
-        print(f"  [{i+1}/{n_iter}] RMSE={np.sqrt(score):.4f}  {params}")
+        model.fit(
+            X_train, y_train,
+            eval_set=[(X_val, y_val)],
+            callbacks=[lgb.early_stopping(STOP, verbose=False), lgb.log_evaluation(-1)],
+        )
+        n_trees = model.best_iteration_ or MAX_ROUNDS
+        score   = np.sqrt(mean_squared_error(y_val, model.predict(X_val)))
+        print(f"  [{i+1}/{n_iter}] RMSE={score:.4f}  trees={n_trees}  {params}")
         if score < best_score:
-            best_score = score
-            best_params = params
+            best_score, best_params, best_n = score, params, n_trees
 
+    print(f"  Best RMSE={best_score:.4f} @ {best_n} trees")
     print(f"  Best params: {best_params}")
-    print(f"  Refitting with early stopping...")
     final = LGBMRegressor(
         **best_params,
-        n_estimators=500,
+        n_estimators=MAX_ROUNDS,
+        subsample_freq=1,
         random_state=RANDOM_STATE,
+        n_jobs=-1,
         verbose=-1,
     )
     final.fit(
         X_train, y_train,
         eval_set=[(X_val, y_val)],
-        callbacks=[lgb.early_stopping(30, verbose=False), lgb.log_evaluation(-1)],
+        callbacks=[lgb.early_stopping(STOP, verbose=False), lgb.log_evaluation(-1)],
     )
     print(f"  Best iteration: {final.best_iteration_}")
+    final.tuned_params_   = {**best_params, 'n_estimators': int(final.best_iteration_ or best_n)}
+    final.tuned_val_rmse_ = float(best_score)
     return final
 
 
-# ─── 6. Stacking ensemble (uses tuned params) ─────────────────────────────────
+def tune_ridge(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_val:   pd.DataFrame,
+    y_val:   pd.Series,
+    alphas=None,
+) -> Ridge:
+    """
+    Grid search over the L2 penalty alpha on a standardised data.
+    """
+    if alphas is None:
+        alphas = np.logspace(-3, 3, 25)
+
+    sc   = StandardScaler().fit(X_train)
+    Xtr  = sc.transform(X_train)
+    Xvl  = sc.transform(X_val)
+
+    best_score, best_alpha = np.inf, 1.0
+    print(f"  Alpha search ({len(alphas)} values)...")
+    for a in alphas:
+        m     = Ridge(alpha=float(a), random_state=RANDOM_STATE).fit(Xtr, y_train)
+        score = np.sqrt(mean_squared_error(y_val, m.predict(Xvl)))
+        if score < best_score:
+            best_score, best_alpha = score, float(a)
+
+    print(f"  Best RMSE={best_score:.4f} @ alpha={best_alpha:.4g}")
+    final = Ridge(alpha=best_alpha, random_state=RANDOM_STATE)
+    final.tuned_params_   = {'alpha': best_alpha}
+    final.tuned_val_rmse_ = float(best_score)
+    return final
+
+
+def tune_random_forest(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_val:   pd.DataFrame,
+    y_val:   pd.Series,
+    n_iter:  int = 20,
+) -> RandomForestRegressor:
+    """
+    Randomized search scored on the validation set
+    """
+    param_dist = {
+        'n_estimators':      [200, 300, 500, 800],
+        'max_depth':         [None, 10, 15, 20, 30],
+        'min_samples_leaf':  [1, 2, 5, 10],
+        'min_samples_split': [2, 5, 10],
+        'max_features':      ['sqrt', 'log2', 0.5, 1.0],
+    }
+
+    rng = np.random.RandomState(RANDOM_STATE)
+    best_score, best_params = np.inf, None
+
+    print(f"  Random search ({n_iter} candidates)...")
+    for i in range(n_iter):
+        params = {k: v[rng.randint(len(v))] for k, v in param_dist.items()}
+        model = RandomForestRegressor(
+            **params, random_state=RANDOM_STATE, n_jobs=-1,
+        )
+        model.fit(X_train, y_train)
+        score = np.sqrt(mean_squared_error(y_val, model.predict(X_val)))
+        print(f"  [{i+1}/{n_iter}] RMSE={score:.4f}  {params}")
+        if score < best_score:
+            best_score, best_params = score, params
+
+    print(f"  Best RMSE={best_score:.4f}")
+    print(f"  Best params: {best_params}")
+    final = RandomForestRegressor(**best_params, random_state=RANDOM_STATE, n_jobs=-1)
+    final.tuned_params_   = best_params
+    final.tuned_val_rmse_ = float(best_score)
+    return final
+
+
+# 6. Stacking ensemble
 
 def build_stacking(
-    xgb_model: XGBRegressor,
-    lgbm_model: LGBMRegressor,
+    xgb_model:   XGBRegressor,
+    lgbm_model:  LGBMRegressor,
+    rf_model:    RandomForestRegressor,
+    ridge_model: Ridge,
+    passthrough: bool = True,
 ) -> StackingRegressor:
     """
-    Build a stacking ensemble using the tuned XGBoost and LightGBM models
-    as base learners (via their best params, not the fitted objects).
-    RF is included as a diversity-adding base learner.
-    Meta-learner is Ridge regression.
+    Build a stacking ensemble from the tuned RF, XGBoost,LightGBM with a tuned-Ridge meta-learner.
     """
     xgb_params  = xgb_model.get_params()
     lgbm_params = lgbm_model.get_params()
-
-    # remove early-stopping bookkeeping keys that can't be passed to constructor
-    for key in ['n_estimators', 'callbacks']:
+    for key in ['n_estimators', 'callbacks', 'early_stopping_rounds',
+                'tree_method', 'random_state', 'n_jobs', 'verbose']:
         xgb_params.pop(key,  None)
         lgbm_params.pop(key, None)
 
+    xgb_best  = getattr(xgb_model, 'best_iteration',  None)
+    lgbm_best = getattr(lgbm_model,'best_iteration_', None)
+    n_xgb  = (xgb_best + 1) if isinstance(xgb_best,  (int, np.integer)) and xgb_best  >= 0 else 400
+    n_lgbm = lgbm_best  if isinstance(lgbm_best, (int, np.integer)) and lgbm_best >  0 else 400
+    n_xgb, n_lgbm = max(int(n_xgb), 1), max(int(n_lgbm), 1)
+
+    rf_base    = clone(rf_model)
+    meta_alpha = getattr(ridge_model, 'tuned_params_', {}).get('alpha', 1.0)
+    meta       = make_pipeline(StandardScaler(), Ridge(alpha=meta_alpha, random_state=RANDOM_STATE))
+
     return StackingRegressor(
         estimators=[
-            ('rf',   RandomForestRegressor(
-                        n_estimators=200, max_depth=15,
-                        min_samples_leaf=5, random_state=RANDOM_STATE, n_jobs=-1)),
+            ('rf',   rf_base),
             ('xgb',  XGBRegressor(
-                        n_estimators=xgb_model.best_iteration or 400,
+                        n_estimators=n_xgb,
                         tree_method='hist',
                         **xgb_params, random_state=RANDOM_STATE, n_jobs=-1)),
             ('lgbm', LGBMRegressor(
-                        n_estimators=getattr(lgbm_model, 'best_iteration_', 400),
+                        n_estimators=n_lgbm,
                         **lgbm_params, random_state=RANDOM_STATE, n_jobs=-1, verbose=-1)),
         ],
-        final_estimator=Ridge(alpha=1.0),
-        cv=5,
+        final_estimator=meta,
+        cv=KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE),
+        passthrough=passthrough,
         n_jobs=-1,
     )
 
 
-# ─── 7. Plots ─────────────────────────────────────────────────────────────────
+# 7. Plots
 
 def plot_feature_importance(
     model,
@@ -409,7 +494,7 @@ def plot_feature_importance(
     top_n: int = 20,
     save_path=None,
 ):
-    """Bar chart of the top_n MDI feature importances."""
+    """Bar chart of the top_n feature importance"""
     importance = pd.Series(model.feature_importances_, index=feature_names)
     importance = importance.sort_values(ascending=False).head(top_n)
 
@@ -423,37 +508,13 @@ def plot_feature_importance(
         plt.savefig(save_path, dpi=150)
     plt.show()
 
-
-def plot_shap(model, X: pd.DataFrame, title: str, save_path=None):
-    """
-    SHAP summary plot (beeswarm). Shows direction and magnitude of each
-    feature's effect — more informative than MDI importance alone.
-    Requires: pip install shap
-    """
-    if not HAS_SHAP:
-        print("SHAP not installed. Run: pip install shap")
-        return
-
-    print(f"  Computing SHAP values for {title}...")
-    explainer   = shap.TreeExplainer(model)
-    shap_values = explainer.shap_values(X)
-
-    plt.figure(figsize=(10, 8))
-    shap.summary_plot(shap_values, X, show=False)
-    plt.title(title)
-    plt.tight_layout()
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.show()
-
-
 def plot_residuals(
     y_true,
     y_pred_log,
     title: str,
     save_path=None,
 ):
-    """Residuals-vs-predicted and residual distribution side-by-side."""
+    """Residuals vspredicted and residual distribution."""
     residuals = np.asarray(y_true) - np.asarray(y_pred_log)
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
@@ -476,7 +537,7 @@ def plot_residuals(
 
 
 def plot_model_comparison(results_df: pd.DataFrame, save_path=None):
-    """Horizontal bar chart comparing test R² and RMSE across all models."""
+    """Horizontal bar chart comparing test R2 and RMSE across all models."""
     df = results_df.copy()
     df = df.sort_values('test_r2', ascending=True)
 
@@ -496,169 +557,3 @@ def plot_model_comparison(results_df: pd.DataFrame, save_path=None):
     if save_path:
         plt.savefig(save_path, dpi=150)
     plt.show()
-
-
-# ─── 8. Residual MLP ──────────────────────────────────────────────────────────
-
-class ResidualMLP(
-    __import__('torch').nn.Module
-):
-    """
-    Two-block residual MLP for tabular price prediction.
-    Architecture: input_proj → [ResBlock × 2] → output
-    Each ResBlock: Linear → BN → ReLU → Dropout → Linear → BN, plus skip.
-    """
-
-    def __init__(self, input_dim: int, hidden_dim: int = 256, dropout: float = 0.2):
-        import torch.nn as nn
-        super().__init__()
-
-        self.input_proj = nn.Linear(input_dim, hidden_dim)
-
-        def _block():
-            return nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.BatchNorm1d(hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.BatchNorm1d(hidden_dim),
-            )
-
-        self.block1 = _block()
-        self.block2 = _block()
-        self.relu   = nn.ReLU()
-        self.output = nn.Linear(hidden_dim, 1)
-
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
-                nn.init.zeros_(m.bias)
-
-    def forward(self, x):
-        x = self.relu(self.input_proj(x))
-        x = self.relu(x + self.block1(x))
-        x = self.relu(x + self.block2(x))
-        return self.output(x).squeeze(1)
-
-
-def train_residual_mlp(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    X_val:   pd.DataFrame,
-    y_val:   pd.Series,
-    hidden_dim: int = 256,
-    dropout:    float = 0.2,
-    epochs:     int = 200,
-    lr:         float = 1e-3,
-    patience:   int = 25,
-    batch_size: int = 256,
-    save_path=None,
-):
-    """
-    Train the ResidualMLP and return the fitted model + training history.
-    Scales features internally. Uses HuberLoss + AdamW + CosineAnnealingLR.
-    """
-    import torch
-    import torch.nn as nn
-    from torch.utils.data import DataLoader, TensorDataset
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"  Training ResidualMLP on {device}  "
-          f"(hidden={hidden_dim}, dropout={dropout})")
-
-    sc = StandardScaler()
-    Xtr = sc.fit_transform(X_train)
-    Xvl = sc.transform(X_val)
-
-    def _tensors(X, y):
-        return (torch.FloatTensor(X),
-                torch.FloatTensor(y.values if hasattr(y, 'values') else y))
-
-    Xtr_t, ytr_t = _tensors(Xtr, y_train)
-    Xvl_t, yvl_t = _tensors(Xvl, y_val)
-
-    loader = DataLoader(
-        TensorDataset(Xtr_t, ytr_t),
-        batch_size=batch_size, shuffle=True,
-    )
-
-    model     = ResidualMLP(Xtr.shape[1], hidden_dim, dropout).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=50, eta_min=1e-5
-    )
-    criterion = nn.HuberLoss(delta=1.0)
-
-    Xvl_dev = Xvl_t.to(device)
-    yvl_dev = yvl_t.to(device)
-
-    best_val_loss  = float('inf')
-    best_state     = None
-    patience_count = 0
-    history        = {'train': [], 'val': []}
-
-    for epoch in range(epochs):
-        model.train()
-        train_losses = []
-        for Xb, yb in loader:
-            Xb, yb = Xb.to(device), yb.to(device)
-            optimizer.zero_grad()
-            loss = criterion(model(Xb), yb)
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            train_losses.append(loss.item())
-
-        model.eval()
-        with torch.no_grad():
-            val_loss = criterion(model(Xvl_dev), yvl_dev).item()
-
-        train_loss = float(np.mean(train_losses))
-        history['train'].append(train_loss)
-        history['val'].append(val_loss)
-        scheduler.step()
-
-        if val_loss < best_val_loss:
-            best_val_loss  = val_loss
-            best_state     = {k: v.clone() for k, v in model.state_dict().items()}
-            patience_count = 0
-        else:
-            patience_count += 1
-
-        if epoch % 25 == 0:
-            print(f"    Epoch {epoch:3d} | train={train_loss:.4f} | "
-                  f"val={val_loss:.4f} | patience={patience_count}/{patience}")
-
-        if patience_count >= patience:
-            print(f"    Early stopping at epoch {epoch}")
-            break
-
-    model.load_state_dict(best_state)
-
-    # ── Training curve ────────────────────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(history['train'], label='Train loss', color='steelblue')
-    ax.plot(history['val'],   label='Val loss',   color='coral')
-    ax.set_xlabel('Epoch')
-    ax.set_ylabel('Huber Loss')
-    ax.set_title('Residual MLP — Training Curve')
-    ax.legend()
-    plt.tight_layout()
-    if save_path:
-        plt.savefig(save_path, dpi=150)
-    plt.show()
-
-    return model, sc, history
-
-
-def predict_mlp(model, scaler, X: pd.DataFrame) -> np.ndarray:
-    """Run inference with a trained ResidualMLP."""
-    import torch
-    device = next(model.parameters()).device
-    model.eval()
-    with torch.no_grad():
-        X_scaled = scaler.transform(X)
-        return model(
-            torch.FloatTensor(X_scaled).to(device)
-        ).cpu().numpy()

@@ -1,21 +1,14 @@
 """
 Feature engineering for Airbnb listings and reviews.
 
-Design principles
------------------
-* No leakage: the train/test split and price cap both happen here, before any
-  fitting step (PCA, target encoding, amenity selection).
-* All statistics (PCA, target-encoding means, amenity correlations) are fitted
-  on the training set and only *applied* to the test set.
-* Two encoding variants are produced: one-hot (OHE) and target encoding (TE).
+Inputs:
 
-Inputs
-------
   data/processed/listings_clean.parquet
   data/raw/reviews.csv.gz
 
-Outputs (written by run_features.py)
---------------------------------------
+Outputs:
+
+* Two encoding variants are produced: one-hot (OHE) and target encoding (TE).
   data/processed/train_hotenc.parquet
   data/processed/test_hotenc.parquet
   data/processed/train_targetenc.parquet
@@ -39,10 +32,7 @@ from scipy.stats import pointbiserialr
 from sklearn.decomposition import PCA
 from sklearn.model_selection import train_test_split
 
-# ─── Constants ────────────────────────────────────────────────────────────────
-
 # Fixed reference date = Berlin dataset scrape date.
-# Using today() would give a different host_tenure_days on every run.
 SNAPSHOT_DATE = pd.Timestamp('2025-09-23')
 
 CAP_PERCENTILE   = 0.99
@@ -53,8 +43,8 @@ PCA_N_COMPONENTS         = 50
 TOP_N_AMENITIES          = 20
 MIN_AMENITY_FREQ         = 0.02   # amenity must appear in ≥2% of train listings
 MAX_REVIEWS_PER_LISTING  = 10     # most-recent reviews to run sentiment on
-REVIEW_HALF_LIFE_DAYS    = 365    # exponential decay half-life for recency weighting
-TARGET_SMOOTHING         = 10     # m-estimate smoothing for target encoding
+REVIEW_HALF_LIFE_DAYS    = 365
+TARGET_SMOOTHING         = 10
 
 BERLIN_LANDMARKS = {
     'dist_city_center': (52.5200, 13.4050),   # Alexanderplatz
@@ -65,10 +55,7 @@ BERLIN_LANDMARKS = {
 CAT_COLS = ['room_type', 'neighbourhood_cleansed', 'host_response_time', 'property_type']
 
 # Columns to drop before text processing
-_DROP_PRE_TEXT = [
-    'amenities', 'amenities_parsed',
-    'name', 'picture_url', 'host_verifications', 'host_name',
-]
+_DROP_PRE_TEXT = ['amenities', 'amenities_parsed','name', 'picture_url', 'host_verifications', 'host_name']
 
 # Columns to drop after text processing
 _DROP_POST_TEXT = ['description']
@@ -80,7 +67,7 @@ _DROP_MISC = ['estimated_revenue_l365d']
 _REVIEW_CACHE_PATH = 'outputs/models/review_sentiments_cache.parquet'
 
 
-# ─── 1. Price cap + train/test split ─────────────────────────────────────────
+# 1. Price cap + train/test split
 
 def split_and_cap(
     df: pd.DataFrame,
@@ -91,14 +78,13 @@ def split_and_cap(
     """
     Split into train/test, then derive the price cap from the training set only.
 
-    Capping from the full dataset would leak test-set price information into the
-    threshold used to filter rows — a subtle but real form of data leakage.
+    Capping from the full dataset would leak test-set into the
+    threshold used to filter rows.
 
-    Returns
-    -------
+    Returns:
     train : pd.DataFrame
     test  : pd.DataFrame
-    cap   : float  (the cap value, for reference / logging)
+    cap   : float  (the cap value)
     """
     train, test = train_test_split(df, test_size=test_size, random_state=random_state)
 
@@ -114,7 +100,7 @@ def split_and_cap(
     return train, test, cap
 
 
-# ─── 2. Amenities (data-driven selection on train) ───────────────────────────
+#2. Amenitiese
 
 def _parse_amenities(text) -> list:
     try:
@@ -130,18 +116,15 @@ def select_amenities_biserial(
 ) -> list:
     """
     Select amenities by point-biserial correlation with log_price.
-    Only amenities present in ≥ min_freq of *training* listings are considered,
-    to avoid selecting rare amenities with noisy correlations.
+    Only amenities present in ≥ min_freq of *training* listings are considered
 
-    Parameters
-    ----------
-    train   : training DataFrame (must have 'amenities' and 'log_price')
-    top_n   : how many amenities to keep
+    Parameters:
+    train : training DataFrame
+    top_n: how many amenities to keep
     min_freq: minimum fraction of listings that must have the amenity
 
     Returns
-    -------
-    list of amenity name strings (top_n by |correlation|)
+    list of amenity name strings
     """
     parsed = train['amenities'].apply(_parse_amenities)
     all_counts = Counter(a for sub in parsed for a in sub)
@@ -154,7 +137,7 @@ def select_amenities_biserial(
         flag = parsed.apply(lambda x: int(amenity in x))
         n_pos = flag.sum()
         if n_pos == 0 or n_pos == len(train):
-            continue   # constant feature — skip
+            continue   # constant features are dropped
         corr, _ = pointbiserialr(flag, train['log_price'])
         correlations[amenity] = abs(corr)
 
@@ -178,7 +161,7 @@ def build_amenity_features(df: pd.DataFrame, selected_amenities: list) -> pd.Dat
     return df
 
 
-# ─── 3. Host tenure (reproducible fixed reference date) ──────────────────────
+#3. Host tenure (fixed date)
 
 def extract_host_tenure(
     df: pd.DataFrame,
@@ -186,7 +169,6 @@ def extract_host_tenure(
 ) -> pd.DataFrame:
     """
     Compute host_tenure_days relative to the dataset snapshot date.
-    Using pd.Timestamp.today() would give different values on each run.
     """
     df = df.copy()
     df['host_since'] = pd.to_datetime(df['host_since'])
@@ -195,12 +177,11 @@ def extract_host_tenure(
     return df
 
 
-# ─── 4. Text features ─────────────────────────────────────────────────────────
+# 4. Text features 
 
 def add_description_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Add description_word_count (word count is more meaningful than character
-    count and is less affected by language — German words are longer on average).
+    Add description_word_count
     """
     df = df.copy()
     df['description_word_count'] = df['description'].apply(
@@ -212,30 +193,14 @@ def add_description_features(df: pd.DataFrame) -> pd.DataFrame:
 def load_sentiment_pipeline(
     model_name: str = 'lxyuan/distilbert-base-multilingual-cased-sentiments-student',
 ):
-    """
-    Load a multilingual sentiment pipeline.
 
-    Why not VADER?
-    --------------
-    VADER is an English-only lexicon. A random sample of 300 Berlin reviews shows:
-      English 55% | German 25% | French 5% | Dutch 2% | Italian 2% | other 11%
-    Using VADER on German/French/etc. text produces near-zero scores regardless of
-    actual sentiment, making the feature nearly meaningless for ~45% of reviews.
-
-    Why this model?
-    ---------------
-    lxyuan/distilbert-base-multilingual-cased-sentiments-student is a DistilBERT
-    model distilled from a larger multilingual teacher. It returns
-    positive / neutral / negative labels and is ~2–3× faster than full BERT on CPU,
-    making it practical for ~70 k review texts without a GPU.
-    """
     from transformers import pipeline as hf_pipeline
 
     print(f"  Loading sentiment model: {model_name}")
     pipe = hf_pipeline(
         'sentiment-analysis',
         model=model_name,
-        device=-1,          # CPU; set to 0 if you have a GPU
+        device=-1,          # CPU set to 0 for a GPU
         batch_size=64,
         truncation=True,
         max_length=512,
@@ -244,17 +209,15 @@ def load_sentiment_pipeline(
 
 
 def _label_to_score(label: str) -> float:
-    """Map positive → +1.0, neutral → 0.0, negative → -1.0."""
-    return {'positive': 1.0, 'neutral': 0.0, 'negative': -1.0}.get(
-        label.lower(), 0.0
-    )
+    """Map positive to +1.0, neutral to 0.0, negative to -1.0."""
+    return {'positive': 1.0, 'neutral': 0.0, 'negative': -1.0}.get(label.lower(), 0.0)
 
 
 def compute_sentiment_scores(texts: list, pipe) -> np.ndarray:
     """
     Run the sentiment pipeline on a list of texts.
     Texts are truncated to 1000 characters before tokenisation.
-    Returns an array of scores in [-1, +1].
+    Returns an array of scores in [-1, 1]
     """
     clean = [str(t)[:1000] if t else "" for t in texts]
     results = pipe(clean)
@@ -267,8 +230,7 @@ def add_description_sentiment(
     pipe,
 ) -> tuple:
     """
-    Add multilingual description_sentiment to both splits.
-    The sentiment pipeline is stateless — applying it to test is leak-free.
+    Add multilingual description_sentiment to both splits
     """
     print("    Train descriptions...")
     train = train.copy()
@@ -283,7 +245,7 @@ def add_description_sentiment(
     return train, test
 
 
-# ─── 5. Embeddings + PCA (fit only on train) ──────────────────────────────────
+#5. Embeddings + PCA (fit only on train)
 
 def build_description_embeddings_split(
     train: pd.DataFrame,
@@ -295,15 +257,10 @@ def build_description_embeddings_split(
     """
     Encode descriptions with a SentenceTransformer, then reduce with PCA.
 
-    PCA is *fitted on training embeddings only* and used to *transform* test
-    embeddings. Fitting PCA on all data would leak test-set variance structure
-    into the component directions.
-
     Returns
-    -------
-    train, test         : DataFrames with desc_emb_0 … desc_emb_{n-1} columns added
-    pca                 : fitted PCA object (save with joblib for reproducibility)
-    train_raw, test_raw : full-dimensional embedding arrays (n × D)
+    train, test : DataFrames with desc_emb_n columns
+    pca  : fitted PCA object
+    train_raw, test_raw : full-dimensional embedding arrays
     """
     print("    Encoding train descriptions...")
     train_raw = embed_model.encode(
@@ -319,7 +276,7 @@ def build_description_embeddings_split(
     )
 
     pca = PCA(n_components=n_components, random_state=42)
-    train_pca = pca.fit_transform(train_raw)   # fit on train ONLY
+    train_pca = pca.fit_transform(train_raw)   # fit on train
     test_pca  = pca.transform(test_raw)         # apply to test
     print(f"    PCA variance explained: {pca.explained_variance_ratio_.sum():.2%}")
 
@@ -333,10 +290,10 @@ def build_description_embeddings_split(
     return train, test, pca, train_raw, test_raw
 
 
-# ─── 6. Spatial features ──────────────────────────────────────────────────────
+#6. Spatial features
 
 def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Great-circle distance in km between two (lat, lon) points."""
+    """sphere distance in km between two (lat, lon) points."""
     R = 6371
     lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
     dlat, dlon = lat2 - lat1, lon2 - lon1
@@ -360,7 +317,7 @@ def add_spatial_features(
     return df
 
 
-# ─── 7. Review sentiment (VADER + recency-weighted) ──────────────────────────
+#7. Review sentiment (VADER + recency-weighted)
 
 def build_review_sentiment(
     reviews: pd.DataFrame,
@@ -373,37 +330,23 @@ def build_review_sentiment(
     """
     Compute per-listing review sentiment features using VADER.
 
-    Why VADER here (not the multilingual transformer)?
-    ---------------------------------------------------
-    Running the transformer on ~54k review texts takes 30+ minutes on CPU.
-    VADER is a vectorised lexicon: it processes 54k texts in ~2 seconds.
-    Tradeoff: VADER is English-only, so German/French reviews (~45%) get
-    near-neutral scores. This is acceptable because:
-      1. The listings already have 7 numeric review score columns
-         (review_scores_rating, cleanliness, communication, …) which
-         directly capture quality from all reviewers.
-      2. Text sentiment is a supplementary signal on top of those scores.
-    The multilingual transformer is reserved for listing descriptions (~7k
-    texts), where there is no numeric score equivalent.
-
     Features
-    --------
-    review_sentiment_mean        : plain mean of VADER compound scores
-    review_sentiment_min         : most negative review (problem signal)
-    review_sentiment_std         : variability across reviews
-    review_sentiment_recency_wt  : exponentially weighted mean (recent = higher weight)
+    review_sentiment_mean   : plain mean of VADER compound scores
+    review_sentiment_min       : most negative review (problem signal)
+    review_sentiment_std   : variability across reviews
+    review_sentiment_recency_wt : exponentially weighted mean (recent = higher weight)
     """
     from pathlib import Path
     from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
-    # ── Cache hit ─────────────────────────────────────────────────────────────
+    # Cache
     if cache_path is not None:
         cache_path = Path(cache_path)
         if cache_path.exists():
             print(f"    Loading cached review sentiments from {cache_path}")
             return pd.read_parquet(cache_path)
 
-    # ── Compute ───────────────────────────────────────────────────────────────
+    # Compute
     reviews = reviews[reviews['listing_id'].isin(valid_ids)].copy()
     reviews['date'] = pd.to_datetime(reviews['date'], errors='coerce')
 
@@ -421,9 +364,9 @@ def build_review_sentiment(
         lambda x: analyzer.polarity_scores(str(x))['compound']
     )
 
-    # recency weight: exp(-ln2 * age / half_life)  →  1.0 for today, 0.5 at half_life
+    # recency weight: exp(-ln2 * age / half_life) = 1.0 for today, 0.5 in half_life
     days_old = (snapshot_date - reviews['date']).dt.days.clip(lower=0)
-    days_old = days_old.fillna(snapshot_date.year * 365)   # unknown date → very old
+    days_old = days_old.fillna(snapshot_date.year * 365)   # unknown date = very old
     reviews['recency_weight'] = np.exp(-np.log(2) * days_old / half_life_days)
 
     def _recency_mean(g):
@@ -442,7 +385,7 @@ def build_review_sentiment(
     result = base_agg.join(recency).reset_index()
     result['review_sentiment_std'] = result['review_sentiment_std'].fillna(0)
 
-    # ── Cache save ────────────────────────────────────────────────────────────
+    #Cache saved
     if cache_path is not None:
         cache_path = Path(cache_path)
         cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -472,7 +415,7 @@ def merge_review_features(
     return listings
 
 
-# ─── 8. Categorical encoding ──────────────────────────────────────────────────
+#8. Categorical encoding
 
 def onehot_encode(
     train: pd.DataFrame,
@@ -481,18 +424,7 @@ def onehot_encode(
     top_property_types: int = 10,
 ) -> tuple:
     """
-    One-hot encode categorical columns.
-
-    Fitted on train only:
-      - The top-N property types are determined from the training distribution;
-        any type not in the top N (in either split) becomes 'Other'.
-      - After get_dummies, test is *aligned* to train's column set — columns
-        absent from test are filled with 0, columns absent from train are dropped.
-        This prevents unseen categories from creating extra test columns.
-
-    neighbourhood_cleansed produces ~134 binary columns. If you find this too
-    wide, switch to target encoding (see target_encode below) which collapses
-    it to a single numeric column.
+    One-hot encode categorical columns
     """
     train, test = train.copy(), test.copy()
 
@@ -508,7 +440,7 @@ def onehot_encode(
     train = pd.get_dummies(train, columns=cat_cols, drop_first=True)
     test  = pd.get_dummies(test,  columns=cat_cols, drop_first=True)
 
-    # align so both splits have identical columns
+    # align suchthat splits have identical columns
     train, test = train.align(test, join='left', axis=1, fill_value=0)
 
     return train, test
@@ -522,14 +454,14 @@ def target_encode(
     smoothing: int = TARGET_SMOOTHING,
 ) -> tuple:
     """
-    Smoothed (m-estimate) target encoding. Fitted on train only.
+    Smoothed (m-estimate) target encoding. Fitted on train.
 
     Each category is replaced by a weighted blend:
-        encoded = (count * category_mean + m * global_mean) / (count + m)
+     = (count * category_mean + m * global_mean)/(count + m)
 
     where m = smoothing. High-frequency categories converge to their true mean;
-    rare categories are pulled toward the global mean — preventing the extreme
-    values that naive target encoding assigns to rare categories.
+    rare categories are pulled toward the global mean preventing the extreme
+    values that simple target encoding assigns to rare categories.
 
     The original categorical columns are dropped from both splits.
     """
@@ -551,13 +483,12 @@ def target_encode(
     return train, test
 
 
-# ─── 9. Cleanup ───────────────────────────────────────────────────────────────
+#9. Cleanup
 
 def clean_col_names(df: pd.DataFrame) -> pd.DataFrame:
     """
     Replace any character that is not alphanumeric or underscore with '_'.
-    Required for LightGBM and for consistent column names across both encoding
-    variants.
+    Required for LightGBM
     """
     df = df.copy()
     df.columns = [re.sub(r'[^A-Za-z0-9_]', '_', col) for col in df.columns]
@@ -569,7 +500,7 @@ def _drop_columns(df: pd.DataFrame, cols: list) -> pd.DataFrame:
     return df.drop(columns=present)
 
 
-# ─── 10. Master pipeline ──────────────────────────────────────────────────────
+#10. main pipeline
 
 def build_features_pipeline(
     train: pd.DataFrame,
@@ -577,57 +508,55 @@ def build_features_pipeline(
     reviews: pd.DataFrame,
 ) -> dict:
     """
-    Full feature engineering pipeline. Accepts a pre-split (and price-capped)
-    train/test pair. Returns a dict with:
-
-        train_ohe, test_ohe   : one-hot encoded DataFrames
-        train_te,  test_te    : target-encoded DataFrames
-        pca                   : fitted PCA object (save with joblib)
-        train_emb_raw         : raw train embeddings (n_train × embedding_dim)
-        test_emb_raw          : raw test  embeddings (n_test  × embedding_dim)
-        selected_amenities    : list of selected amenity name strings
+    Full feature engineering pipeline.
+      Returns a dict with:
+        train_ohe, test_ohe  : one-hot encoded DataFrames
+        train_te,  test_te  : target-encoded DataFrames
+        pca           : fitted PCA object
+        train_emb_raw    : raw train embeddings
+        test_emb_raw    : raw test  embeddings
+        selected_amenities : list of selected amenity name strings
     """
     from sentence_transformers import SentenceTransformer
 
-    # ── Step 1: Amenity selection (train only) ────────────────────────────────
+    #  Step 1: Amenity selection (train)
     print("\n[1/8] Selecting amenities via point-biserial correlation (train only)...")
     selected_amenities = select_amenities_biserial(train)
 
-    # ── Step 2: Structural features (both splits) ─────────────────────────────
+    #  Step 2: Remaining features
     print("\n[2/8] Building amenity, host tenure, description, and spatial features...")
     for name, df in (('train', train), ('test', test)):
         df = build_amenity_features(df, selected_amenities)
         df = extract_host_tenure(df)
         df = add_description_features(df)
         df = add_spatial_features(df)
-        df = _drop_columns(df, _DROP_PRE_TEXT)   # drop amenities / host_name etc.
-                                                  # keep 'description' for next steps
+        df = _drop_columns(df, _DROP_PRE_TEXT)                                        
         df = _drop_columns(df, _DROP_MISC)
         if name == 'train':
             train = df
         else:
             test = df
 
-    # ── Step 3: Load models ───────────────────────────────────────────────────
+    #Step 3: Load models
     print("\n[3/8] Loading multilingual sentiment pipeline and embedding model...")
     sent_pipe   = load_sentiment_pipeline()
     embed_model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
 
-    # ── Step 4: Description sentiment ────────────────────────────────────────
+    # Step 4: Description sentiment
     print("\n[4/8] Computing multilingual description sentiment...")
     train, test = add_description_sentiment(train, test, sent_pipe)
 
-    # ── Step 5: Description embeddings + PCA ─────────────────────────────────
+    # Step 5: Description embeddings + PCA
     print("\n[5/8] Computing description embeddings (PCA fitted on train only)...")
     train, test, pca, train_emb_raw, test_emb_raw = build_description_embeddings_split(
         train, test, embed_model
     )
 
-    # ── Step 6: Drop description column (processed) ──────────────────────────
+    #  Step 6: Drop description column (processed) 
     train = _drop_columns(train, _DROP_POST_TEXT)
     test  = _drop_columns(test,  _DROP_POST_TEXT)
 
-    # ── Step 7: Review sentiment ──────────────────────────────────────────────
+    #  Step 7: Review sentiment
     print("\n[6/8] Computing review sentiment (VADER, recency-weighted)...")
     all_valid_ids = set(train['id'].tolist()) | set(test['id'].tolist())
     review_feats  = build_review_sentiment(
@@ -637,7 +566,7 @@ def build_features_pipeline(
     train = merge_review_features(train, review_feats)
     test  = merge_review_features(test,  review_feats)
 
-    # ── Step 8: Categorical encoding → two variants ───────────────────────────
+    #  Step 8: Categorical encoding → two variants 
     print("\n[7/8] One-hot encoding categorical columns...")
     y_train = train['log_price']
     train_ohe, test_ohe = onehot_encode(train, test)
