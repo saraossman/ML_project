@@ -18,7 +18,7 @@ def _save(fig: plt.Figure, filename: str) -> None:
     out = FIGURES_DIR / filename
     fig.savefig(out, dpi=150, bbox_inches='tight')
     plt.close(fig)
-    print(f"Saved → {out}")
+    print(f"Saved to {out}")
 
 
 # Price
@@ -127,11 +127,13 @@ def plot_binary_vs_price(df: pd.DataFrame) -> None:
 
 # Categorical features
 
-def plot_categorical_vs_price(df: pd.DataFrame) -> None:
-    """Boxplot of log_price for each category in room_type and host_response_time."""
-    cat_features = ['room_type', 'host_response_time']
-
-    for feat in cat_features:
+def plot_categorical_vs_price(df: pd.DataFrame, top_property_types: int = 5) -> None:
+    """
+    Boxplot of log_price for room_type, host_response_time, and property_type.
+    For property_type, only the top N types are shown, the rest grouped as 'Other'.
+    """
+    # room_type and host_response_time
+    for feat in ['room_type', 'host_response_time']:
         fig, ax = plt.subplots(figsize=(8, 4))
         order = df.groupby(feat)['log_price'].median().sort_values(ascending=False).index
         sns.boxplot(data=df, x=feat, y='log_price', order=order, ax=ax)
@@ -139,6 +141,20 @@ def plot_categorical_vs_price(df: pd.DataFrame) -> None:
         ax.set_title(f'{feat} vs log(price)')
         plt.tight_layout()
         _save(fig, f'{feat}_vs_price.png')
+ 
+    # property_type
+    top_types = df['property_type'].value_counts().head(top_property_types).index
+    df_plot = df.copy()
+    df_plot['property_type'] = df_plot['property_type'].where(
+        df_plot['property_type'].isin(top_types), 'Other'
+    )
+    order = df_plot.groupby('property_type')['log_price'].median().sort_values(ascending=False).index
+    fig, ax = plt.subplots(figsize=(8, 4))
+    sns.boxplot(data=df_plot, x='property_type', y='log_price', order=order, ax=ax)
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
+    ax.set_title('property_type vs log(price)')
+    plt.tight_layout()
+    _save(fig, 'property_type_vs_price.png')
 
 
 # Neighbourhood
