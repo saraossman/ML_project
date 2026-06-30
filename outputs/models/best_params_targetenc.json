@@ -1,0 +1,46 @@
+{
+  "ridge": {
+    "params": {
+      "alpha": 100.0
+    },
+    "val_rmse": 0.32660120552238314
+  },
+  "random_forest": {
+    "params": {
+      "n_estimators": 500,
+      "max_depth": 20,
+      "min_samples_leaf": 1,
+      "min_samples_split": 10,
+      "max_features": 0.5
+    },
+    "val_rmse": 0.30087121319294613
+  },
+  "xgboost": {
+    "params": {
+      "max_depth": 5,
+      "learning_rate": 0.03,
+      "subsample": 0.6,
+      "colsample_bytree": 0.7,
+      "min_child_weight": 5,
+      "reg_alpha": 0.0,
+      "reg_lambda": 2.0,
+      "gamma": 0.0,
+      "n_estimators": 1345
+    },
+    "val_rmse": 0.26951620843994395
+  },
+  "lightgbm": {
+    "params": {
+      "num_leaves": 15,
+      "max_depth": 12,
+      "learning_rate": 0.03,
+      "subsample": 0.9,
+      "colsample_bytree": 0.7,
+      "min_child_samples": 20,
+      "reg_alpha": 0.0,
+      "reg_lambda": 2.0,
+      "n_estimators": 1368
+    },
+    "val_rmse": 0.2716727913627082
+  }
+}
