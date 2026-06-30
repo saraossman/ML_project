@@ -4,7 +4,6 @@ channels:
 dependencies:
   - python=3.12
   - pip
-  # scientific / data stack
   - numpy
   - pandas
   - scipy
@@ -17,7 +16,7 @@ dependencies:
   # gradient boosting
   - xgboost
   - lightgbm
-  # pip-only packages (NLP / deep learning)
+  # pip packages
   - pip:
       - torch
       - transformers
