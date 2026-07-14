@@ -20,12 +20,6 @@ import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 
 
-# In[1]:
-
-
-get_ipython().system('pip cache purge && pip install pyarrow')
-
-
 # In[2]:
 
 
