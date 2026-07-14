@@ -37,6 +37,7 @@ ML_project/
 │   ├── run_eda.py
 │   ├── run_features.py
 │   └── run_training.py
+|   └── run_nn.py                     # PyTorch feedforward NN baseline
 │
 ├── outputs/
 │   ├── figures/                      # EDA plots + model evaluation figures
@@ -192,6 +193,26 @@ outputs/models/best_params_{encoding}.json
 
 ---
 
+### 5. Train Neural Network model
+
+```bash
+python scripts/run_nn.py
+```
+
+Loads `train_hotenc.parquet` / `test_hotenc.parquet` via `load_data()`, scales features with `StandardScaler`, and trains a feedforward regressor:
+
+**Architecture (`AirbnbPriceRegressor`)**
+- Input → 128 → ReLU → Dropout(0.2)
+- 128 → 64 → ReLU → Dropout(0.2)
+- 64 → 1 (linear output, predicts log_price)
+
+**Training config:** Adam (lr=0.001), MSE loss, batch size 64, 100 epochs, 15% validation split.
+
+Saves:
+```
+outputs/figures/nn_training_history.png     # train/val loss curve
+```
+
 ## Results
 
 All metrics are computed in EUR space (prices are exponentiated before computing RMSE/MAE/MAPE). R² is computed on log-price
@@ -207,6 +228,7 @@ All metrics are computed in EUR space (prices are exponentiated before computing
 | XGBoost (tuned) | 0.769 | 0.774 | 49.82 | 29.18 | 20.97 |
 | **LightGBM (tuned)** | **0.775** | **0.777** | **49.54** | **28.60** | **20.63** |
 | Stacking (RF + XGB + LGBM) | — | 0.772 | 49.03 | 29.10 | 21.05 |
+| Neural Network (PyTorch) | — | 0.698 | 57.87 | 34.45 | 24.01 |
 
 ### Target encoding (`targetenc`)
 
