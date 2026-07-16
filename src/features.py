@@ -31,9 +31,10 @@ from math import atan2, cos, radians, sin, sqrt
 from scipy.stats import pointbiserialr
 from sklearn.decomposition import PCA
 from sklearn.model_selection import train_test_split
+from .constants import DATASET_DATE 
 
 # Fixed reference date = Berlin dataset scrape date.
-SNAPSHOT_DATE = pd.Timestamp('2025-09-23')
+SNAPSHOT_DATE = pd.Timestamp(DATASET_DATE)
 
 CAP_PERCENTILE   = 0.99
 RANDOM_STATE     = 42

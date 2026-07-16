@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import re
+from .constants import DATASET_DATE 
 
 """
 Data cleaning functions for Airbnb listings
@@ -161,7 +162,7 @@ def extract_date_features(df: pd.DataFrame) -> pd.DataFrame:
     9999 means never reviewed. Drop raw date columns.
     """
     df['days_since_last_review'] = (
-        pd.to_datetime('today') - pd.to_datetime(df['last_review'])
+        pd.to_datetime(DATASET_DATE) - pd.to_datetime(df['last_review'])
     ).dt.days
     df['days_since_last_review'] = df['days_since_last_review'].fillna(9999)
     df.drop(columns=['first_review', 'last_review'], inplace=True)
